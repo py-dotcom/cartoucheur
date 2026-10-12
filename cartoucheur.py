@@ -343,13 +343,20 @@ LOGO_SVG_B64 = (
     "My41MDEsMi4xOTMsNS44QzUxMC4xMjksOTUuNzIyLDQ5NC4yNjIsOTguMTg5LDQ3OC40OSwxMDIuNTIyIi8+CjwvZz4KPC9z"
     "dmc+Cg=="
 )
-# Akai MPD218, preset d'usine, banque A : pads 1-16 = notes 36-51.
-# Le pad 1 est en bas à gauche, comme sur l'écran : la grille reproduit le contrôleur.
-# Canal -1 = n'importe quel canal (le MPD218 envoie sur le canal 10 par défaut).
+# Mapping par défaut Akai MPD218, canal 10 :
+#   ligne 1 (A1-D1) = notes 80-83, ligne 2 = 76-79, ligne 3 = 72-75, ligne 4 (A4-D4) = 68-71
 MPD218_NAME = "MPD218"
+MPD218_CHANNEL = 9   # canal 10 (mido compte à partir de 0)
+MPD218_BASE = 68     # note du pad A4, en bas à gauche
 
 
 def mpd218_key(index):
+    row, col = divmod(index, COLS)
+    return ["note", MPD218_CHANNEL, MPD218_BASE + (ROWS - 1 - row) * COLS + col]
+
+
+def old_mpd218_key(index):
+    """Mapping par défaut des versions précédentes (notes 36-51, tout canal)."""
     row, col = divmod(index, COLS)
     return ["note", -1, 36 + (ROWS - 1 - row) * COLS + col]
 
@@ -396,6 +403,8 @@ def load_config():
                    for i in range(NPADS)]
     if not any(p["midi"] for p in cfg["pads"]) and not cfg["stop_all_midi"]:
         apply_mpd218(cfg)
+    elif all(p["midi"] == old_mpd218_key(i) for i, p in enumerate(cfg["pads"])):
+        apply_mpd218(cfg)  # ancien mapping par défaut jamais modifié : on passe au nouveau
     return cfg
 
 
@@ -1241,7 +1250,7 @@ class MainWindow(QtWidgets.QMainWindow):
         apply_mpd218(self.cfg)
         self.led_state = [None] * NPADS
         self.save()
-        self.status("Pads assignés au MPD218 (banque A).")
+        self.status("Pads assignés au MPD218 (notes 68-83, canal 10).")
 
     def set_learn_mode(self, on):
         self.learn_mode = on
