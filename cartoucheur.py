@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Cartoucheur 4x4 Transistoc'h — lecteur de jingles pour la radio (V2).
+Cartoucheur 4x4 Transistoc'h — lecteur de jingles pour la radio (V3).
 
 - 16 pads nommés A1…D4 (colonnes A jaune, B rose, C vert, D mauve)
-- horloge, alerte « FIN DE SON », export/import de banques (.cartouche)
+- horloge, vumètre, alerte 5 s avant la fin, corbeilles, export/import de banques (.cartouche)
 - mapping Akai MPD218 automatique
 - pads, glisser-déposer des sons (wav, mp3, flac, ogg, aiff)
 - choix de la sortie carte son
@@ -53,8 +53,9 @@ MODES = {
 }
 COL_NAMES = "ABCD"
 COL_COLORS = ["#f2c230", "#ec6fae", "#4dbb66", "#9d7fd8"]  # A jaune, B rose, C vert, D mauve
-END_ALERT_SEC = 4.0      # durée de l'alerte « FIN DE SON »
-WARN_SEC = 5.0           # temps restant affiché en rouge sur les dernières secondes
+WARN_SEC = 5.0           # alerte et temps en rouge sur les 5 dernières secondes
+UNDO_SEC = 10            # durée du bouton « Annuler » après vidage d'une colonne
+VU_MIN_DB = -48.0        # bas de l'échelle du vumètre
 BANK_EXT = ".cartouche"
 
 
@@ -498,6 +499,8 @@ class AudioEngine:
         self.channels = 2
         self.master = 1.0
         self.ended = []  # pads arrivés au bout, lus par l'interface
+        self.meter = np.zeros(2, dtype=np.float32)  # crête depuis la dernière lecture
+        self.clipped = False
 
     def open(self, device_index):
         self.close()
@@ -531,6 +534,11 @@ class AudioEngine:
                     v.ended = False
             self.voices = [v for v in self.voices if not v.done]
         mix *= self.master
+        if frames:
+            peaks = np.abs(mix).max(axis=0)
+            np.maximum(self.meter, peaks, out=self.meter)
+            if peaks.max() > 1.0:
+                self.clipped = True
         np.clip(mix, -1.0, 1.0, out=mix)
         if self.channels == 1:
             outdata[:, 0] = mix.mean(axis=1)
@@ -557,6 +565,13 @@ class AudioEngine:
         with self.lock:
             for v in self.voices:
                 v.fade_out(self._fade_n())
+
+    def pop_meter(self):
+        peaks = np.minimum(self.meter, 1.0)
+        clipped = self.clipped
+        self.meter = np.zeros(2, dtype=np.float32)
+        self.clipped = False
+        return peaks, clipped
 
     def pop_ended(self):
         with self.lock:
@@ -669,11 +684,125 @@ def midi_label(key):
     return f"{prefix}{num}" if ch < 0 else f"{prefix}{num} c{ch + 1}"
 
 
+# ----------------------------------------------------------------- icônes
+def draw_trash(p, rect, color):
+    """Petite corbeille vectorielle dans rect (QRectF)."""
+    p.save()
+    pen = QtGui.QPen(color, max(1.2, rect.width() / 11))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    p.drawLine(QtCore.QPointF(x + w * .12, y + h * .22), QtCore.QPointF(x + w * .88, y + h * .22))
+    p.drawLine(QtCore.QPointF(x + w * .38, y + h * .22), QtCore.QPointF(x + w * .40, y + h * .08))
+    p.drawLine(QtCore.QPointF(x + w * .40, y + h * .08), QtCore.QPointF(x + w * .60, y + h * .08))
+    p.drawLine(QtCore.QPointF(x + w * .60, y + h * .08), QtCore.QPointF(x + w * .62, y + h * .22))
+    body = QtGui.QPolygonF([QtCore.QPointF(x + w * .22, y + h * .30), QtCore.QPointF(x + w * .78, y + h * .30),
+                            QtCore.QPointF(x + w * .72, y + h * .94), QtCore.QPointF(x + w * .28, y + h * .94)])
+    p.drawPolygon(body)
+    for fx in (.40, .60):
+        p.drawLine(QtCore.QPointF(x + w * fx, y + h * .42), QtCore.QPointF(x + w * fx, y + h * .82))
+    p.restore()
+
+
+def trash_icon(color="#15181c", size=18):
+    pm = QtGui.QPixmap(size * 2, size * 2)
+    pm.fill(Qt.transparent)
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    draw_trash(p, QtCore.QRectF(2, 2, size * 2 - 4, size * 2 - 4), QtGui.QColor(color))
+    p.end()
+    pm.setDevicePixelRatio(2)
+    return QtGui.QIcon(pm)
+
+
+# ----------------------------------------------------------------- vumètre
+class VuMeter(QtWidgets.QWidget):
+    """Vumètre stéréo horizontal : crête, maintien du pic 1 s, témoin de saturation."""
+
+    def __init__(self):
+        super().__init__()
+        self.level = [VU_MIN_DB, VU_MIN_DB]
+        self.peak = [VU_MIN_DB, VU_MIN_DB]
+        self.peak_t = [0.0, 0.0]
+        self.clip_t = 0.0
+        self.setMinimumSize(220, 46)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+    def push(self, peaks, clipped, now, dt):
+        for c in range(2):
+            db = 20 * np.log10(max(peaks[c], 1e-6))
+            db = max(VU_MIN_DB, min(0.0, db))
+            # montée instantanée, retombée d'environ 24 dB/s
+            self.level[c] = db if db > self.level[c] else max(db, self.level[c] - 24 * dt)
+            if db >= self.peak[c] or now - self.peak_t[c] > 1.0:
+                self.peak[c], self.peak_t[c] = db, now
+        if clipped:
+            self.clip_t = now
+        self._now = now
+        self.update()
+
+    def _x(self, db, x0, w):
+        return x0 + w * (db - VU_MIN_DB) / -VU_MIN_DB
+
+    def paintEvent(self, e):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        clip_w = 30
+        x0, w = 16.0, self.width() - 16 - clip_w - 8
+        bar_h, gap, top = 11.0, 4.0, 4.0
+        zones = [(VU_MIN_DB, -12, "#3fbf5f"), (-12, -3, "#f0a830"), (-3, 0, "#e53935")]
+        f = self.font()
+        f.setPointSizeF(7.5)
+        f.setBold(True)
+        p.setFont(f)
+        for c in range(2):
+            y = top + c * (bar_h + gap)
+            p.setPen(QtGui.QColor("#8b939e"))
+            p.drawText(QtCore.QRectF(0, y - 1, 14, bar_h + 2), Qt.AlignCenter, "LR"[c])
+            p.setPen(Qt.NoPen)
+            p.setBrush(QtGui.QColor("#262b33"))
+            p.drawRoundedRect(QtCore.QRectF(x0, y, w, bar_h), 3, 3)
+            lvl = self.level[c]
+            for lo, hi, col in zones:
+                if lvl <= lo:
+                    break
+                a, b = self._x(lo, x0, w), self._x(min(lvl, hi), x0, w)
+                p.setBrush(QtGui.QColor(col))
+                p.drawRect(QtCore.QRectF(a, y, b - a, bar_h))
+            if self.peak[c] > VU_MIN_DB + 1:
+                px = self._x(self.peak[c], x0, w)
+                p.setBrush(QtGui.QColor("#ffffff"))
+                p.drawRect(QtCore.QRectF(px - 1.5, y, 3, bar_h))
+        # graduations
+        p.setPen(QtGui.QColor("#6f7782"))
+        f.setBold(False)
+        f.setPointSizeF(7)
+        p.setFont(f)
+        ty = top + 2 * bar_h + gap + 2
+        for db in (-40, -30, -20, -12, -6, -3, 0):
+            x = self._x(db, x0, w)
+            p.drawText(QtCore.QRectF(x - 14, ty, 28, 12), Qt.AlignCenter, str(db))
+        # témoin de saturation (allumé 2 s)
+        on = getattr(self, "_now", 0) - self.clip_t < 2.0
+        led = QtCore.QRectF(self.width() - clip_w, top, clip_w, 2 * bar_h + gap)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QColor("#e53935" if on else "#3a2226"))
+        p.drawRoundedRect(led, 4, 4)
+        p.setPen(QtGui.QColor("#ffffff" if on else "#7a5a5e"))
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(led, Qt.AlignCenter, "CLIP")
+
+
 # ----------------------------------------------------------------- pad
 class PadWidget(QtWidgets.QWidget):
     clicked = QtCore.Signal(int)
     menuRequested = QtCore.Signal(int, QtCore.QPoint)
     filesDropped = QtCore.Signal(int, list)
+    trashClicked = QtCore.Signal(int)
+    TRASH = 20  # taille de la zone corbeille
 
     def __init__(self, index):
         super().__init__()
@@ -691,8 +820,16 @@ class PadWidget(QtWidgets.QWidget):
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setCursor(Qt.PointingHandCursor)
 
+    def trash_rect(self):
+        r = QtCore.QRectF(self.rect()).adjusted(3, 3, -3, -3)
+        t = self.TRASH
+        return QtCore.QRectF(r.right() - t - 6, r.bottom() - t - 5, t, t)
+
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
+            if self.cfg["file"] and self.trash_rect().adjusted(-4, -4, 4, 4).contains(e.position()):
+                self.trashClicked.emit(self.index)
+                return
             self.clicked.emit(self.index)
         elif e.button() == Qt.RightButton:
             self.menuRequested.emit(self.index, e.globalPosition().toPoint())
@@ -740,7 +877,8 @@ class PadWidget(QtWidgets.QWidget):
         dim.setAlpha(150)
 
         if self.playing and self.progress > 0:
-            bar = QtCore.QRectF(r.left() + 6, r.bottom() - 10, (r.width() - 12) * self.progress, 5)
+            bar_w = r.width() - 12 - self.TRASH - 10
+            bar = QtCore.QRectF(r.left() + 6, r.bottom() - 10, bar_w * self.progress, 5)
             p.setBrush(fg)
             p.drawRoundedRect(bar, 2, 2)
 
@@ -787,7 +925,13 @@ class PadWidget(QtWidgets.QWidget):
             f3.setBold(self.playing)
             p.setFont(f3)
             p.setPen(QtGui.QColor("#c81e1e" if light else "#ff5a5a") if self.warn else fg)
-            p.drawText(inner.adjusted(0, 0, 0, -6), Qt.AlignRight | Qt.AlignBottom, self.time_text)
+            p.drawText(inner.adjusted(0, 0, 0, -(self.TRASH + 4) if self.cfg["file"] else -6),
+                       Qt.AlignRight | Qt.AlignBottom, self.time_text)
+
+        if self.cfg["file"]:
+            tc = QtGui.QColor(fg)
+            tc.setAlpha(170)
+            draw_trash(p, self.trash_rect(), tc)
 
 
 # ----------------------------------------------------------------- fenêtre
@@ -834,28 +978,20 @@ class MainWindow(QtWidgets.QMainWindow):
         logo.setPixmap(self._logo_pixmap(46))
         header.addWidget(logo)
 
-        self.title_lbl = QtWidgets.QLabel(self.cfg["title"])
-        tf = self.title_lbl.font()
-        tf.setPointSize(18)
-        tf.setBold(True)
-        self.title_lbl.setFont(tf)
-        self.title_lbl.setToolTip("Double-clic pour renommer l'émission")
-        self.title_lbl.installEventFilter(self)
-        header.addWidget(self.title_lbl)
-        header.addStretch(1)
+        self.vu = VuMeter()
+        header.addWidget(self.vu, 1)
 
         self.end_lbl = QtWidgets.QLabel("")
         self.end_lbl.setAlignment(Qt.AlignCenter)
-        self.end_lbl.setMinimumWidth(260)
-        self.end_lbl.setMinimumHeight(44)
+        self.end_lbl.setFixedWidth(290)
+        self.end_lbl.setFixedHeight(46)
         ef = self.end_lbl.font()
         ef.setPointSize(15)
         ef.setBold(True)
         self.end_lbl.setFont(ef)
-        self._end_until = 0.0
-        self._end_text = ""
+        self.end_idle_style = "border:1px solid #2c323b; border-radius:8px; color:#4a525d;"
+        self.end_lbl.setStyleSheet(self.end_idle_style)
         header.addWidget(self.end_lbl)
-        header.addStretch(1)
 
         self.clock_lbl = QtWidgets.QLabel("00:00:00")
         cf = QtGui.QFont("Consolas")
@@ -896,10 +1032,27 @@ class MainWindow(QtWidgets.QMainWindow):
         grid = QtWidgets.QGridLayout()
         grid.setSpacing(6)
         for c in range(COLS):
-            h = QtWidgets.QLabel(COL_NAMES[c])
-            h.setAlignment(Qt.AlignCenter)
-            h.setStyleSheet(f"background:{COL_COLORS[c]}; color:#15181c; font-weight:bold;"
-                            "font-size:16px; border-radius:5px; padding:3px;")
+            h = QtWidgets.QFrame()
+            h.setObjectName("colhead")
+            h.setStyleSheet(f"QFrame#colhead {{ background:{COL_COLORS[c]}; border-radius:5px; }}")
+            hl = QtWidgets.QHBoxLayout(h)
+            hl.setContentsMargins(8, 2, 4, 2)
+            spacer = QtWidgets.QWidget()
+            spacer.setFixedWidth(26)
+            hl.addWidget(spacer)
+            lbl = QtWidgets.QLabel(COL_NAMES[c])
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet("color:#15181c; font-weight:bold; font-size:16px; background:transparent;")
+            hl.addWidget(lbl, 1)
+            tb = QtWidgets.QToolButton()
+            tb.setIcon(trash_icon())
+            tb.setIconSize(QtCore.QSize(16, 16))
+            tb.setFixedSize(26, 24)
+            tb.setToolTip(f"Vider la colonne {COL_NAMES[c]}")
+            tb.setStyleSheet("QToolButton { border:none; border-radius:4px; background:transparent; }"
+                             "QToolButton:hover { background:rgba(0,0,0,0.18); }")
+            tb.clicked.connect(lambda _=False, col=c: self.clear_column(col))
+            hl.addWidget(tb)
             grid.addWidget(h, 0, c + 1)
         for r_ in range(ROWS):
             n = QtWidgets.QLabel(str(r_ + 1))
@@ -914,6 +1067,7 @@ class MainWindow(QtWidgets.QMainWindow):
             w.clicked.connect(lambda i: self.trigger(i, from_click=True))
             w.menuRequested.connect(self.pad_menu)
             w.filesDropped.connect(self.on_files_dropped)
+            w.trashClicked.connect(self.ask_clear_pad)
             grid.addWidget(w, i // COLS + 1, i % COLS + 1)
             self.pads.append(w)
         root.addLayout(grid, 1)
@@ -971,6 +1125,17 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
         self.setMinimumSize(1000, 660)
 
+        self.undo_btn = QtWidgets.QPushButton("Annuler")
+        self.undo_btn.setStyleSheet("QPushButton { background:#ffd23f; color:#111; font-weight:bold;"
+                                    "padding:3px 14px; }")
+        self.undo_btn.clicked.connect(self.undo_clear)
+        self.undo_btn.hide()
+        self.statusBar().addPermanentWidget(self.undo_btn)
+        self.undo_data = None
+        self.undo_timer = QtCore.QTimer(self)
+        self.undo_timer.setSingleShot(True)
+        self.undo_timer.timeout.connect(self.drop_undo)
+
     @staticmethod
     def _logo_pixmap(height):
         renderer = QtSvg.QSvgRenderer(QtCore.QByteArray(base64.b64decode("".join(LOGO_SVG_B64))))
@@ -985,18 +1150,6 @@ class MainWindow(QtWidgets.QMainWindow):
         painter.end()
         pm.setDevicePixelRatio(ratio)
         return pm
-
-    def eventFilter(self, obj, ev):
-        if obj is self.title_lbl and ev.type() == QtCore.QEvent.MouseButtonDblClick:
-            txt, ok = QtWidgets.QInputDialog.getText(self, "Nom de l'émission", "Nom :",
-                                                     text=self.cfg["title"])
-            if ok and txt.strip():
-                self.cfg["title"] = txt.strip()
-                self.title_lbl.setText(self.cfg["title"])
-                self.setWindowTitle(f"{self.cfg['title']} — Cartoucheur Transistoc'h")
-                self.save()
-            return True
-        return super().eventFilter(obj, ev)
 
     def status(self, msg, ms=6000):
         self.statusBar().showMessage(msg, ms)
@@ -1194,29 +1347,19 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         super().keyPressEvent(e)
 
-    def show_end_alert(self, i):
-        self._end_text = f"FIN DE SON · {pad_name(i)}"
-        self._end_until = QtCore.QDateTime.currentMSecsSinceEpoch() / 1000 + END_ALERT_SEC
-
     def tick(self):
         now = datetime.datetime.now().strftime("%H:%M:%S")
         if self.clock_lbl.text() != now:
             self.clock_lbl.setText(now)
 
-        for i in self.engine.pop_ended():
-            self.show_end_alert(i)
         t = QtCore.QDateTime.currentMSecsSinceEpoch() / 1000
-        if t < self._end_until:
-            blink = int(t * 3) % 2 == 0
-            self.end_lbl.setText(self._end_text)
-            self.end_lbl.setStyleSheet(
-                "border-radius:8px; padding:4px 16px; color:white;"
-                f"background:{'#d42b2b' if blink else '#7a1c1c'};")
-        elif self.end_lbl.text():
-            self.end_lbl.setText("")
-            self.end_lbl.setStyleSheet("")
+        dt = t - getattr(self, "_last_tick", t)
+        self._last_tick = t
+        peaks, clipped = self.engine.pop_meter()
+        self.vu.push(peaks, clipped, t, dt)
 
         sr = self.engine.samplerate
+        soonest = None  # (temps restant, pad) du son qui finit le premier
         for i, w in enumerate(self.pads):
             st = self.engine.state(i)
             data = self.cache.get(i)
@@ -1227,6 +1370,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 remaining = (length - pos) / sr
                 w.time_text = "-" + fmt_time(remaining)
                 w.warn = remaining <= WARN_SEC and self.cfg["pads"][i]["mode"] != "loop"
+                if w.warn and (soonest is None or remaining < soonest[0]):
+                    soonest = (remaining, i)
             else:
                 w.playing = False
                 w.progress = 0
@@ -1237,6 +1382,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.led_state[i] != w.playing:
                 self.led_state[i] = w.playing
                 self.midi.send_led(self.cfg["pads"][i]["midi"], w.playing)
+
+        if soonest:
+            secs = max(1, int(np.ceil(soonest[0])))
+            blink = int(t * 3) % 2 == 0
+            text = f"FIN DANS {secs} s · {pad_name(soonest[1])}"
+            if self.end_lbl.text() != text:
+                self.end_lbl.setText(text)
+            self.end_lbl.setStyleSheet("border-radius:8px; color:white;"
+                                       f"background:{'#d42b2b' if blink else '#8a1f1f'};")
+        elif self.end_lbl.text():
+            self.end_lbl.setText("")
+            self.end_lbl.setStyleSheet(self.end_idle_style)
 
     # ---------- MIDI
     def on_mpd218(self):
@@ -1350,12 +1507,62 @@ class MainWindow(QtWidgets.QMainWindow):
             self.midi.send_led(pad["midi"], False)
             pad["midi"] = None
         elif act is a_clear:
-            self.engine.stop(i)
-            self.cfg["pads"][i] = {**default_pad(), "midi": pad["midi"]}
-            self.pads[i].cfg = self.cfg["pads"][i]
-            self.load_pad(i)
+            self.ask_clear_pad(i)
+            return
         self.pads[i].update()
         self.save()
+
+    # ---------- vidage
+    def clear_pad(self, i):
+        self.engine.stop(i)
+        self.cfg["pads"][i] = {**default_pad(), "midi": self.cfg["pads"][i]["midi"]}
+        self.pads[i].cfg = self.cfg["pads"][i]
+        self.load_pad(i)
+
+    def ask_clear_pad(self, i):
+        pad = self.cfg["pads"][i]
+        if not pad["file"]:
+            return
+        if QtWidgets.QMessageBox.question(
+                self, "Vider le pad",
+                f"Vider le pad {pad_name(i)} ({self.pads[i].display_name()}) ?") \
+                != QtWidgets.QMessageBox.Yes:
+            return
+        self.clear_pad(i)
+        self.save()
+        self.status(f"Pad {pad_name(i)} vidé.")
+
+    def clear_column(self, col):
+        idx = [r * COLS + col for r in range(ROWS)]
+        if not any(self.cfg["pads"][i]["file"] for i in idx):
+            self.status(f"La colonne {COL_NAMES[col]} est déjà vide.")
+            return
+        self.undo_data = (col, {i: json.loads(json.dumps(self.cfg["pads"][i])) for i in idx})
+        for i in idx:
+            self.clear_pad(i)
+        self.save()
+        self.status(f"Colonne {COL_NAMES[col]} vidée.", UNDO_SEC * 1000)
+        self.undo_btn.setText(f"Annuler (colonne {COL_NAMES[col]})")
+        self.undo_btn.show()
+        self.undo_timer.start(UNDO_SEC * 1000)
+
+    def undo_clear(self):
+        if not self.undo_data:
+            return
+        col, saved = self.undo_data
+        for i, pad in saved.items():
+            self.engine.stop(i)
+            self.cfg["pads"][i] = pad
+            self.pads[i].cfg = pad
+            self.load_pad(i)
+        self.save()
+        self.drop_undo()
+        self.status(f"Colonne {COL_NAMES[col]} restaurée.")
+
+    def drop_undo(self):
+        self.undo_data = None
+        self.undo_timer.stop()
+        self.undo_btn.hide()
 
     # ---------- banques
     def export_bank(self):
@@ -1443,6 +1650,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.stop_all()
         for i in range(NPADS):
             self.midi.send_led(self.cfg["pads"][i]["midi"], False)
+        self.drop_undo()
         self.cfg["pads"] = new_pads
         self.cfg["stop_all_midi"] = manifest.get("stop_all_midi")
         if not any(p["midi"] for p in new_pads) and not self.cfg["stop_all_midi"]:
