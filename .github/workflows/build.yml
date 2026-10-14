@@ -14,3 +14,4 @@ jobs:
         with:
           name: Cartoucheur
           path: dist/Cartoucheur.exe
+          retention-days: 7
